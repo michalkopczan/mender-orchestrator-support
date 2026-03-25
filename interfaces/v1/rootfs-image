@@ -106,7 +106,6 @@ case "$STATE" in
         ;;
 
     Inventory)
-        mender-update show-provides
         ;;
 
     Identity)
