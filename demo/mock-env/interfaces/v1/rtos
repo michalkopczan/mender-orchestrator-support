@@ -125,20 +125,24 @@ case "$STATE" in
 
         ;;
 
+    Provides)
+        [ -f "$INSTANCE_DIR/$STATE.FAIL" ] && { log "Failing $STATE"; exit 1; }
+        cat "$INSTANCE_DIR/Provides"
+
+        ;;
+
+
+    Inventory)
+        if [ -f "$INSTANCE_DIR/$STATE.FAIL" ]; then
+            echo "Failing $STATE"
+            exit 1
+        fi
+
+        ;;
+
 
     Identity)
         [ -f "$INSTANCE_DIR/$STATE.FAIL" ] && { log "Failing $STATE"; exit 1; }
         cat $INSTANCE_DIR/Identity
         ;;
 esac
-
-# These are when the CLI is invoked with Provides or Inventory. We just duplicate them here, but
-# they could potentially be different since inventory can have lists.
-
-if [ "$STATE" = "Provides" ] || [ "$STATE" = "Inventory" ]; then
-
-    [ -f "$INSTANCE_DIR/$STATE.FAIL" ] && { log "Failing $STATE"; exit 1; }
-    cat "$INSTANCE_DIR/Provides"
-
-fi
-
