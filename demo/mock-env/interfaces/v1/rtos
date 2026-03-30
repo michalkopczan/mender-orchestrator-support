@@ -41,7 +41,10 @@ case "$STATE" in
     Download)
         NEW_VERSION=$(jq -r '.artifact_provides.version' ${HEADER_DIR}/type-info)
         log "$STATE [Attempting update to: $NEW_VERSION]"
-        [ -f "$INSTANCE_DIR/$STATE.FAIL" ] && { log "Failing $STATE"; exit 1; }
+        if [ -f "$INSTANCE_DIR/$STATE.FAIL" ]; then
+            log "Failing $STATE"
+            exit 1
+        fi
 
         CURRENT_PROVIDES=$(cat "$INSTANCE_DIR/Provides" | grep version)
         # The #*= in the parameter expansion removes everything before and including the = character
@@ -58,17 +61,26 @@ case "$STATE" in
     ArtifactInstall)
         NEW_VERSION=$(jq -r '.artifact_provides.version' ${HEADER_DIR}/type-info)
         log "$STATE [Attempting update to: $NEW_VERSION]"
-        [ -f "$INSTANCE_DIR/$STATE.FAIL" ] && { log "Failing $STATE"; exit 1; }
+        if [ -f "$INSTANCE_DIR/$STATE.FAIL" ]; then
+            log "Failing $STATE"
+            exit 1
+        fi
         ;;
 
     ArtifactReboot)
         NEW_VERSION=$(jq -r '.artifact_provides.version' ${HEADER_DIR}/type-info)
         log "$STATE [Attempting update to: $NEW_VERSION]"
-        [ -f "$INSTANCE_DIR/$STATE.FAIL" ] && { log "Failing $STATE"; exit 1; }
+        if [ -f "$INSTANCE_DIR/$STATE.FAIL" ]; then
+            log "Failing $STATE"
+            exit 1
+        fi
         ;;
 
     NeedsArtifactReboot)
-        [ -f "$INSTANCE_DIR/$STATE.FAIL" ] && { log "Failing $STATE"; exit 1; }
+        if [ -f "$INSTANCE_DIR/$STATE.FAIL" ]; then
+            log "Failing $STATE"
+            exit 1
+        fi
 
         NEEDS_ARTIFACT_REBOOT=$(cat "$INSTANCE_DIR/NeedsArtifactReboot")
 
@@ -77,7 +89,10 @@ case "$STATE" in
         ;;
 
     NeedsUnpackedArtifact)
-        [ -f "$INSTANCE_DIR/$STATE.FAIL" ] && { log "Failing $STATE"; exit 1; }
+        if [ -f "$INSTANCE_DIR/$STATE.FAIL" ]; then
+            log "Failing $STATE"
+            exit 1
+        fi
 
 
         NEEDS_UNPACKED=$(cat "$INSTANCE_DIR/NeedsUnpackedArtifact" 2>/dev/null || echo "No")
@@ -87,7 +102,10 @@ case "$STATE" in
         ;;
 
     SupportsRollback)
-        [ -f "$INSTANCE_DIR/$STATE.FAIL" ] && { log "Failing $STATE"; exit 1; }
+        if [ -f "$INSTANCE_DIR/$STATE.FAIL" ]; then
+            log "Failing $STATE"
+            exit 1
+        fi
 
         SUPPORTS_ROLLBACK=$(cat "$INSTANCE_DIR/SupportsRollback")
 
@@ -98,7 +116,10 @@ case "$STATE" in
     ArtifactRollback)
         ATTEMPTED_UPDATE_VERSION=$(cat "$INSTANCE_DIR/NewVersionRef")
         OLD_VERSION=$(cat "$INSTANCE_DIR/OldVersionRef")
-        [ -f "$INSTANCE_DIR/$STATE.FAIL" ] && { log "Failing $STATE"; exit 1; }
+        if [ -f "$INSTANCE_DIR/$STATE.FAIL" ]; then
+            log "Failing $STATE"
+            exit 1
+        fi
         log "$STATE [Update to $ATTEMPTED_UPDATE_VERSION didn't work. Rolling back to: $OLD_VERSION]"
         sed -i -n '/device_type/p' "$INSTANCE_DIR/Provides"
         echo "version=$OLD_VERSION" >> "$INSTANCE_DIR/Provides"
@@ -108,7 +129,10 @@ case "$STATE" in
     ArtifactCommit)
         ATTEMPTED_UPDATE_VERSION=$(cat "$INSTANCE_DIR/NewVersionRef")
         OLD_VERSION=$(cat "$INSTANCE_DIR/OldVersionRef")
-        [ -f "$INSTANCE_DIR/$STATE.FAIL" ] && { log "Failing $STATE"; exit 1; }
+        if [ -f "$INSTANCE_DIR/$STATE.FAIL" ]; then
+            log "Failing $STATE"
+            exit 1
+        fi
         log "$STATE [Update to $ATTEMPTED_UPDATE_VERSION worked.]"
         # On ArtifactCommit, override also version
         sed -i -n '/device_type/p' "$INSTANCE_DIR/Provides"
@@ -120,13 +144,19 @@ case "$STATE" in
     ArtifactFailure)
         ATTEMPTED_UPDATE_VERSION=$(cat "$INSTANCE_DIR/NewVersionRef")
         OLD_VERSION=$(cat "$INSTANCE_DIR/OldVersionRef")
-        [ -f "$INSTANCE_DIR/$STATE.FAIL" ] && { log "Failing $STATE"; exit 1; }
+        if [ -f "$INSTANCE_DIR/$STATE.FAIL" ]; then
+            log "Failing $STATE"
+            exit 1
+        fi
         log "$STATE [Update to $ATTEMPTED_UPDATE_VERSION didn't work.]"
 
         ;;
 
     Provides)
-        [ -f "$INSTANCE_DIR/$STATE.FAIL" ] && { log "Failing $STATE"; exit 1; }
+        if [ -f "$INSTANCE_DIR/$STATE.FAIL" ]; then
+            log "Failing $STATE"
+            exit 1
+        fi
         cat "$INSTANCE_DIR/Provides"
 
         ;;
@@ -134,7 +164,7 @@ case "$STATE" in
 
     Inventory)
         if [ -f "$INSTANCE_DIR/$STATE.FAIL" ]; then
-            echo "Failing $STATE"
+            log "Failing $STATE"
             exit 1
         fi
 
@@ -142,7 +172,10 @@ case "$STATE" in
 
 
     Identity)
-        [ -f "$INSTANCE_DIR/$STATE.FAIL" ] && { log "Failing $STATE"; exit 1; }
+        if [ -f "$INSTANCE_DIR/$STATE.FAIL" ]; then
+            log "Failing $STATE"
+            exit 1
+        fi
         cat $INSTANCE_DIR/Identity
         ;;
 esac
