@@ -111,6 +111,20 @@ if [ -z "${manifest_file}" ]; then
     show_help_and_exit_error
 fi
 
+# Ensure 'order' is an integer between 1 and 100
+for order in $(sed -n -e 's/^[[:space:]]*order://p' "$manifest_file"); do
+    case "$order" in
+        *[!0-9]*|"")
+            echo "Error: 'order' must be an integer between 1 and 100" 1>&2
+            exit 1
+            ;;
+    esac
+    if [ "$order" -lt 1 ] || [ "$order" -gt 100 ]; then
+        echo "Error: 'order' must be an integer between 1 and 100" 1>&2
+        exit 1
+    fi
+done
+
 # Check the the passthrough_args and potentially modify them
 # to avoid conflicts or to let them override the already args
 # provided to mender-artifact
