@@ -17,6 +17,7 @@ all:
 
 install: $(UPDATE_INTERFACES_INSTALL_TARGETS)
 uninstall: $(UPDATE_INTERFACES_UNINSTALL_TARGETS)
+clean:
 
 install-mock-env: install-mock-instances install-mock-topology $(MOCK_ENV_INTERFACES_INSTALL_TARGETS)
 uninstall-mock-env: uninstall-mock-instances uninstall-mock-topology $(MOCK_ENV_INTERFACES_UNINSTALL_TARGETS)
@@ -65,6 +66,7 @@ uninstall-mock-env-interfaces-v1-%:
 .PHONY: all
 .PHONY: install
 .PHONY: uninstall
+.PHONY: clean
 .PHONY: install-mock-env
 .PHONY: install-mock-instances
 .PHONY: install-mock-topology
