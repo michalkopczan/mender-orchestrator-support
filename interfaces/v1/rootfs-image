@@ -120,7 +120,7 @@ case "$STATE" in
     Identity)
         if [ "$STATE" = "Identity" ]; then
             [ -f "$INSTANCE_DIR/$STATE.FAIL" ] && { log "Failing $STATE"; exit 1; }
-            id=$(/usr/share/mender/identity/mender-device-identity | sed -n 's/^mac=//p')
+            id=$(/usr/share/mender/identity/mender-device-identity | sed -rn '1s/^[^=]+=//p')
             echo "id=$id"
         fi
         ;;
