@@ -7,9 +7,9 @@ components:
     interface: rootfs-image
 
   - component_type: rtos
-    interface: rtos
+    interface: rtos-interface
     interface_args: ["1"]
 
   - component_type: rtos
-    interface: rtos
+    interface: rtos-interface
     interface_args: ["2"]

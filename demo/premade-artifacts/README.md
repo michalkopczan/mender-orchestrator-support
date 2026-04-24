@@ -1,6 +1,7 @@
 Rtos artifacts were created with:
 
 ```bash
+INTERFACE=rtos-interface
 DEVICE=rtos
 VERSION=$DEVICE-v3
 PAYLOAD=$VERSION-payload
@@ -8,7 +9,7 @@ PAYLOAD=$VERSION-payload
 touch $PAYLOAD
 mender-artifact \
   write module-image \
-  --type $DEVICE \
+  --type $INTERFACE \
   --device-type $DEVICE \
   --provides version:$VERSION \
   --clears-provides version.* \

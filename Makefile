@@ -50,13 +50,13 @@ install-mock-topology:
 uninstall-mock-topology:
 	rm -f $(prefix)$(datarootdir)/mender-orchestrator/topology.yaml
 
-# Dynamic targets like install-mock-env-interfaces-v1-rtos
+# Dynamic targets like install-mock-env-interfaces-v1-rtos-interface
 install-mock-env-interfaces-v1-%: INTERFACE=$*
 install-mock-env-interfaces-v1-%:
 	install -m 755 -d $(prefix)$(datadir)/mender-orchestrator/interfaces/v1
 	install -m 755 demo/mock-env/interfaces/v1/$(INTERFACE) $(prefix)$(datadir)/mender-orchestrator/interfaces/v1/
 
-# Dynamic targets like uninstall-mock-env-interfaces-v1-rtos
+# Dynamic targets like uninstall-mock-env-interfaces-v1-rtos-interface
 uninstall-mock-env-interfaces-v1-%: INTERFACE=$*
 uninstall-mock-env-interfaces-v1-%:
 	rm -f $(prefix)$(datadir)/mender-orchestrator/interfaces/v1/$(INTERFACE)
