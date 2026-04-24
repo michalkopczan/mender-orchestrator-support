@@ -10,11 +10,7 @@ touch $PAYLOAD
 mender-artifact \
   write module-image \
   --type $INTERFACE \
-  --device-type $DEVICE \
-  --provides version:$VERSION \
-  --clears-provides version.* \
-  --no-default-clears-provides \
-  --no-default-software-version \
+  --compatible-types $DEVICE \
   --file $PAYLOAD \
   --output-path $VERSION.mender \
   --artifact-name $VERSION
