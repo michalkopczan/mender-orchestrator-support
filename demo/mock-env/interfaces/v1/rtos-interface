@@ -39,7 +39,7 @@ is_cmd_available cat
 case "$STATE" in
 
     Download)
-        NEW_VERSION=$(jq -r '.artifact_provides.version' ${HEADER_DIR}/type-info)
+        NEW_VERSION=$(jq -r --arg iface "$INTERFACE_NAME" '.artifact_provides.["rootfs-image." + $iface + ".version"]' ${HEADER_DIR}/type-info)
         log "$STATE [Attempting update to: $NEW_VERSION]"
         if [ -f "$INSTANCE_DIR/$STATE.FAIL" ]; then
             log "Failing $STATE"
@@ -59,7 +59,7 @@ case "$STATE" in
         ;;
 
     ArtifactInstall)
-        NEW_VERSION=$(jq -r '.artifact_provides.version' ${HEADER_DIR}/type-info)
+        NEW_VERSION=$(jq -r --arg iface "$INTERFACE_NAME" '.artifact_provides.["rootfs-image." + $iface + ".version"]' ${HEADER_DIR}/type-info)
         log "$STATE [Attempting update to: $NEW_VERSION]"
         if [ -f "$INSTANCE_DIR/$STATE.FAIL" ]; then
             log "Failing $STATE"
@@ -68,7 +68,7 @@ case "$STATE" in
         ;;
 
     ArtifactReboot)
-        NEW_VERSION=$(jq -r '.artifact_provides.version' ${HEADER_DIR}/type-info)
+        NEW_VERSION=$(jq -r --arg iface "$INTERFACE_NAME" '.artifact_provides.["rootfs-image." + $iface + ".version"]' ${HEADER_DIR}/type-info)
         log "$STATE [Attempting update to: $NEW_VERSION]"
         if [ -f "$INSTANCE_DIR/$STATE.FAIL" ]; then
             log "Failing $STATE"
@@ -157,7 +157,7 @@ case "$STATE" in
             log "Failing $STATE"
             exit 1
         fi
-        cat "$INSTANCE_DIR/Provides"
+        sed "s|^version=|rootfs-image.${INTERFACE_NAME}.version=|" "$INSTANCE_DIR/Provides"
 
         ;;
 

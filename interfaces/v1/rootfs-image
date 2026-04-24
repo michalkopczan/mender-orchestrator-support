@@ -102,11 +102,11 @@ case "$STATE" in
         # "rootfs-image.version" key in Provides. We need to provide a default value so that
         # the mandatory "version" key is present.
         output=$(mender-update show-provides)
-        if echo "$output" | grep -qE "^(version=|rootfs-image\.version=)"; then
+        if echo "$output" | grep -qE "^rootfs-image\.version="; then
             echo "$output"
         else
             echo "$output"
-            echo "version=unknown"
+            echo "rootfs-image.version=unknown"
         fi
         # Also submit device_type, which is in a separate file, not in the database. We don't know if the
         # file contains a newline, so it's important that this is done last, to avoid corrupting other
