@@ -45,7 +45,12 @@ case "$STATE" in
             log "Failing $STATE"
             exit 1
         fi
+        ;;
 
+    ArtifactInstall)
+        NEW_VERSION=$(jq -r --arg iface "$INTERFACE_NAME" '.artifact_provides.["rootfs-image." + $iface + ".version"]' ${HEADER_DIR}/type-info)
+        log "$STATE [Attempting update to: $NEW_VERSION]"
+        
         CURRENT_PROVIDES=$(cat "$INSTANCE_DIR/Provides" | grep version)
         # The #*= in the parameter expansion removes everything before and including the = character
         CURRENT_VERSION=${CURRENT_PROVIDES#*=}
@@ -56,11 +61,7 @@ case "$STATE" in
         sed -i -n '/device_type/p' "$INSTANCE_DIR/Provides"
         echo "version=$TRANSITION_VERSION" >> "$INSTANCE_DIR/Provides"
         echo "$NEW_VERSION" > "$INSTANCE_DIR/NewVersionRef"
-        ;;
-
-    ArtifactInstall)
-        NEW_VERSION=$(jq -r --arg iface "$INTERFACE_NAME" '.artifact_provides.["rootfs-image." + $iface + ".version"]' ${HEADER_DIR}/type-info)
-        log "$STATE [Attempting update to: $NEW_VERSION]"
+        
         if [ -f "$INSTANCE_DIR/$STATE.FAIL" ]; then
             log "Failing $STATE"
             exit 1
