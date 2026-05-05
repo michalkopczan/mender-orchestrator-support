@@ -100,13 +100,17 @@ case "$STATE" in
     Provides)
         # In case we do not have a bootstrap artifact installed, there will be no
         # "rootfs-image.version" key in Provides. We need to provide a default value so that
-        # the mandatory "version" key is present.
+        # the mandatory "rootfs-image.version" key is present.
+        
+        # Note that since the rootfs-image Interface talks to a Component that runs Mender
+        # there will be a "rootfs-image.version" key, so providing
+        # "rootfs-image.<INTERFACE_NAME>.version" is not necessary as it is for other Interfaces
         output=$(mender-update show-provides)
-        if echo "$output" | grep -qE "^(version=|rootfs-image\.version=)"; then
+        if echo "$output" | grep -qE "^rootfs-image\.version="; then
             echo "$output"
         else
             echo "$output"
-            echo "version=unknown"
+            echo "rootfs-image.version=unknown"
         fi
         # Also submit device_type, which is in a separate file, not in the database. We don't know if the
         # file contains a newline, so it's important that this is done last, to avoid corrupting other
