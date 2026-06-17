@@ -21,7 +21,7 @@ COMPONENT_TYPE="$3"
 
 case "$STATE" in
     NeedsArtifactReboot)
-        echo "Automatic"
+        echo "No"
         ;;
     NeedsUnpackedArtifact)
         echo "No"
@@ -31,15 +31,9 @@ case "$STATE" in
         ;;
 
     Download)
-        device_type=$(sed -n 's/^device_type\s*=\s*//p' ${MENDER_DATASTORE_DIR:-/var/lib/mender}/device_type)
-        if [ "$device_type" != "$COMPONENT_TYPE" ]; then
-            echo "device_type of the System Device does not match its component_type"
-            exit 1
-        fi
         name="$(cat $FILES/stream-next)"
         # Download can go straight to Cleanup, since it is not supposed to have any side effects. It
         # should not go to ArtifactRollback, but let's have it as a safeguard anyway.
-        #TODOKopczan --component should be a unique ID, not COMPONENT_TYPE
         mender-update install \
             --component "$COMPONENT_TYPE" \
             --component-type "$COMPONENT_TYPE" \
@@ -110,30 +104,13 @@ case "$STATE" in
         ;;
 
     Provides)
-        # In case we do not have a bootstrap artifact installed, there will be no
-        # "rootfs-image.version" key in Provides. We need to provide a default value so that
-        # the mandatory "rootfs-image.version" key is present.
-        
-        # Note that since the rootfs-image Interface talks to a Component that runs Mender
-        # there will be a "rootfs-image.version" key, so providing
-        # "rootfs-image.<INTERFACE_NAME>.version" is not necessary as it is for other Interfaces
-        output=$(mender-update show-provides | grep -E "^rootfs-image\..*")
-        if echo "$output" | grep -qE "^rootfs-image\.version="; then
-            echo "$output"
-        else
-            echo "$output"
-            echo "rootfs-image.version=unknown"
-        fi
+        mender-update show-provides | grep -E ".*update-module\.single-file\.version=.*" | sed 's/^rootfs-image\.update-module\./rootfs-image\./'
         ;;
 
     Inventory)
         ;;
 
     Identity)
-        if [ "$STATE" = "Identity" ]; then
-            [ -f "$INSTANCE_DIR/$STATE.FAIL" ] && { log "Failing $STATE"; exit 1; }
-            id=$(/usr/share/mender/identity/mender-device-identity | sed -rn '1s/^[^=]+=//p')
-            echo "id=$id"
-        fi
+        echo "id=single-file-component"
         ;;
 esac
