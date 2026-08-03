@@ -1,0 +1,11 @@
+# Copy to /etc/mender-mqtt-agent/mender-mqtt-agent.conf and adjust for this Component.
+# Read as an EnvironmentFile by mender-mqtt-agent.service.
+
+# Must match the interface_args entry used for this Component in topology.yaml on the
+# System Device.
+MENDER_MQTT_COMPONENT_ID=rpi2-component
+
+# Hostname or IP of the System Device (RPi #1), where the broker listens.
+MENDER_MQTT_BROKER_HOST=
+
+MENDER_MQTT_BROKER_PORT=1883

@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+# Copyright 2026 Northern.tech AS
+#
+#    Licensed under the Apache License, Version 2.0 (the "License");
+#    you may not use this file except in compliance with the License.
+#    You may obtain a copy of the License at
+#
+#        http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS,
+#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#    See the License for the specific language governing permissions and
+#    limitations under the License.
+#
+# mqtt-component -- Mender Orchestrator Interface that drives a Component running on its own
+# board (e.g. a second Raspberry Pi) over MQTT.
+#
+# This script is the *only* thing on the System Device that talks to the MQTT broker. The
+# broker itself (mosquitto) is standalone infrastructure -- see ../../broker -- with no
+# knowledge of mender-orchestrator or mender-update, and no daemon of ours sits in front of
+# it either: every state call is a fresh, short-lived connection from this script to the
+# broker's loopback listener.
+#
+# The actual mender-update invocations happen on the Component, driven by
+# ../../component-agent/mender-mqtt-agent, which mirrors the state-by-state logic of
+# ../rootfs-image exactly -- see that script for the rationale behind each --stop-before.
+#
+# Called as: mqtt-component <STATE> <FILES> <COMPONENT_TYPE> <COMPONENT_ID>
+# where COMPONENT_ID (the interface_args entry in topology.yaml) is also the Component's
+# MQTT topic namespace.
+#
+# The Artifact's bytes (Download state) do NOT travel over MQTT. A rootfs Artifact for a
+# whole second board is realistically hundreds of MB to a few GB, so Download starts a short-lived HTTP
+# server (alive only for that one call) that streams the orchestrator's own FIFO straight
+# into the HTTP response body, one small chunk at a time, and tells the Component agent to
+# fetch it over MENDER_MQTT_INTERFACE_ARTIFACT_HOST via a URL in the (still MQTT-pushed)
+# Download command. Nothing about the control plane -- commands, results, liveness -- changes:
+# it's all still MQTT push, same as every other state.
+
+import http.server
+import json
+import os
+import sys
+import time
+import urllib.parse
+
+import paho.mqtt.client as mqtt
+
+MQTT_HOST = os.environ.get("MENDER_MQTT_INTERFACE_HOST", "127.0.0.1")
+MQTT_PORT = int(os.environ.get("MENDER_MQTT_INTERFACE_PORT", "1883"))
+# Kept comfortably under mender-orchestrator's own per-call Interface timeout (4h default),
+# so a genuine failure is reported by us instead of the call being killed from outside.
+RESULT_TIMEOUT = int(os.environ.get("MENDER_MQTT_INTERFACE_TIMEOUT", str(3 * 3600 + 1800)))
+IDEMPOTENCY_CHECK_TIMEOUT = 3
+# Provides is called as part of `mender-orchestrator show-inventory`, which the Mender
+# Client's own inventory-scan step runs (covering EVERY Component in one invocation) under a
+# single, hardcoded 10-second timeout (DEFAULT_GENERATE_LINE_DATA_TIMEOUT, confirmed from the
+# mender client source) -- this must stay well under that for the WHOLE script, not just this
+# one call, especially with multiple Components each doing their own Provides query in turn.
+QUERY_TOPIC_TIMEOUT = 2
+
+# Address Components use to reach this Interface's Download HTTP server -- normally the
+# System Device's own LAN IP or hostname. Required: unlike MQTT_HOST (always loopback, since
+# the Interface always talks to the broker's local listener), there's no safe default here.
+ARTIFACT_HTTP_HOST = os.environ.get("MENDER_MQTT_INTERFACE_ARTIFACT_HOST")
+DOWNLOAD_CHUNK_SIZE = int(os.environ.get("MENDER_MQTT_DOWNLOAD_CHUNK_SIZE", str(1024 * 1024)))
+
+# States forwarded to the Component's agent, one MQTT round trip each. Query states
+# (Identity, Provides, Inventory, NeedsArtifactReboot, SupportsRollback,
+# NeedsUnpackedArtifact) are answered directly below instead, without forwarding.
+FORWARDED_STATES = {
+    "Download",
+    "ArtifactInstall",
+    "ArtifactReboot",
+    "ArtifactVerifyReboot",
+    "ArtifactCommit",
+    "Cleanup",
+    "ArtifactRollback",
+    "ArtifactRollbackReboot",
+    "ArtifactVerifyRollbackReboot",
+    "ArtifactFailure",
+}
+
+
+def log(msg):
+    print("##### [mqtt-component] %s" % msg, file=sys.stderr)
+
+
+def topics(component_id):
+    base = "mender-orchestrator/%s" % component_id
+    return {
+        "cmd": base + "/cmd",
+        "result": base + "/result",
+        "provides": base + "/provides",
+    }
+
+
+def read_artifact_name(files_dir):
+    path = os.path.join(files_dir, "header", "artifact_name")
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return "unknown"
+
+
+def read_download_stream_chunks(files_dir):
+    stream_next = os.path.join(files_dir, "stream-next")
+    extra_streams = []
+    with open(stream_next) as stream_next_f:
+        first = True
+        seq = 0
+        while True:
+            name = stream_next_f.readline().strip()
+            seq += 1
+            if not name:
+                break
+            if not first:
+                extra_streams.append(name)
+                with open(os.path.join(files_dir, name), "rb") as f:
+                    while f.read(DOWNLOAD_CHUNK_SIZE):
+                        pass
+                continue
+            first = False
+            total = 0
+            with open(os.path.join(files_dir, name), "rb") as f:
+                while True:
+                    chunk = f.read(DOWNLOAD_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    yield chunk
+    if extra_streams:
+        raise RuntimeError(
+            "expected exactly one payload file, got %d more: %s" % (len(extra_streams), extra_streams)
+        )
+
+
+class _ArtifactHTTPHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        # write_failed starts True if even the response headers can't be sent (client already
+        # disconnected) -- in that case we still MUST fully drain read_download_stream_chunks
+        # below, or mender-orchestrator sees this process read at least one stream but never
+        # reach the terminal empty read, and reports "started downloading, but did not finish"
+        # even though nothing here would otherwise have surfaced an error. An uncaught
+        # exception from send_response/send_header/end_headers would otherwise propagate out
+        # of do_GET() entirely -- silently swallowed by socketserver's default handle_error(),
+        # never reaching self.server.error -- so handle_download() would then hang waiting for
+        # an agent result that was never going to arrive, instead of failing cleanly.
+        write_failed = False
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+        except OSError as exc:
+            write_failed = True
+            self.server.error = exc
+            log("do_GET: failed to send headers: %r" % (exc,))
+        try:
+            chunk_count = 0
+            for chunk in read_download_stream_chunks(self.server.files_dir):
+                chunk_count += 1
+                if write_failed:
+                    continue  # still fully drain the FIFO even if the client went away
+                try:
+                    self.wfile.write(("%x\r\n" % len(chunk)).encode())
+                    self.wfile.write(chunk)
+                    self.wfile.write(b"\r\n")
+                except OSError as exc:
+                    write_failed = True
+                    self.server.error = exc
+                    log("do_GET: write failed after %d chunk(s): %r (will keep draining)" % (chunk_count, exc))
+            if not write_failed:
+                self.wfile.write(b"0\r\n\r\n")
+        except (OSError, RuntimeError) as exc:
+            self.server.error = exc
+            log("do_GET: exception escaped the streaming loop: %r" % (exc,))
+
+    def log_message(self, fmt, *args):
+        pass  # suppress BaseHTTPRequestHandler's default per-request access log
+
+
+class _ArtifactHTTPServer(http.server.HTTPServer):
+    def __init__(self, files_dir):
+        super().__init__(("0.0.0.0", 0), _ArtifactHTTPHandler)
+        self.files_dir = files_dir
+        self.error = None
+
+
+class Broker:
+    def __init__(self):
+        self.client = mqtt.Client(protocol=mqtt.MQTTv5)
+        self._messages = {}
+        self.client.on_message = self._on_message
+        self.client.connect(MQTT_HOST, MQTT_PORT, keepalive=30, clean_start=True)
+        self.client.loop_start()
+
+    def _on_message(self, _client, _userdata, msg):
+        self._messages[msg.topic] = msg.payload
+
+    def close(self):
+        self.client.loop_stop()
+        self.client.disconnect()
+
+    def publish_json(self, topic, obj):
+        info = self.client.publish(topic, json.dumps(obj), qos=1, retain=True)
+        info.wait_for_publish(timeout=30)
+
+    def wait_for_json(self, topic, predicate, timeout):
+        self.client.subscribe(topic, qos=1)
+        deadline = time.monotonic() + timeout
+        while True:
+            raw = self._messages.get(topic)
+            if raw is not None:
+                try:
+                    payload = json.loads(raw.decode())
+                except (ValueError, UnicodeDecodeError):
+                    payload = None
+                if payload is not None and predicate(payload):
+                    return payload
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.2)
+
+    def read_retained_text(self, topic, timeout):
+        self.client.subscribe(topic, qos=1)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            raw = self._messages.get(topic)
+            if raw is not None:
+                return raw.decode()
+            time.sleep(0.2)
+        return None
+
+
+def forward_state(broker, t, state, correlation_id, extra_payload=None):
+    def matches(payload):
+        return payload.get("correlation_id") == correlation_id
+
+    # Idempotency: if a previous (crashed/killed) invocation of this exact state already
+    # published its command and the Component already answered, don't redo the action --
+    # just relay the result that's already retained.
+    result = broker.wait_for_json(t["result"], matches, IDEMPOTENCY_CHECK_TIMEOUT)
+    if result is not None:
+        log("%s (%s) already completed, reusing retained result" % (state, correlation_id))
+        return result
+
+    payload = {"correlation_id": correlation_id, "state": state}
+    if extra_payload:
+        payload.update(extra_payload)
+    broker.publish_json(t["cmd"], payload)
+    return broker.wait_for_json(t["result"], matches, RESULT_TIMEOUT)
+
+
+def handle_download(broker, t, correlation_id, files_dir, component_type):
+    def matches(payload):
+        return payload.get("correlation_id") == correlation_id
+
+    already_done = broker.wait_for_json(t["result"], matches, IDEMPOTENCY_CHECK_TIMEOUT)
+    if already_done is not None:
+        try:
+            for _chunk in read_download_stream_chunks(files_dir):
+                pass
+        except (OSError, RuntimeError) as exc:
+            log("failed to drain artifact stream: %s" % exc)
+            return {"exit_code": 1, "stdout": "", "stderr": str(exc)}
+        return already_done
+
+    if not ARTIFACT_HTTP_HOST:
+        message = "MENDER_MQTT_INTERFACE_ARTIFACT_HOST is not set"
+        log(message)
+        return {"exit_code": 1, "stdout": "", "stderr": message}
+
+    try:
+        server = _ArtifactHTTPServer(files_dir)
+    except OSError as exc:
+        log("failed to start artifact HTTP server: %s" % exc)
+        return {"exit_code": 1, "stdout": "", "stderr": str(exc)}
+
+    url = "http://%s:%d/%s" % (
+        ARTIFACT_HTTP_HOST,
+        server.server_address[1],
+        urllib.parse.quote(correlation_id, safe=""),
+    )
+    payload = {
+        "correlation_id": correlation_id,
+        "state": "Download",
+        "artifact_url": url,
+        "component_type": component_type,
+    }
+    broker.publish_json(t["cmd"], payload)
+
+    # No separate short "did anyone connect" timeout: we already know (via the idempotency
+    # check above) that the Component genuinely needs to fetch this Artifact, so any wait
+    # here is bounded by the same overall ceiling as every other state.
+    server.timeout = RESULT_TIMEOUT
+    server.handle_request()
+    server.server_close()
+
+    if server.error is not None:
+        log("failed to stream artifact to component: %s" % server.error)
+        return {"exit_code": 1, "stdout": "", "stderr": str(server.error)}
+
+    return broker.wait_for_json(t["result"], matches, RESULT_TIMEOUT)
+
+
+def main():
+    state = sys.argv[1]
+    files_dir = sys.argv[2] if len(sys.argv) > 2 else None
+    component_type = sys.argv[3] if len(sys.argv) > 3 else None
+    component_id = sys.argv[4] if len(sys.argv) > 4 else None
+
+    if state == "NeedsArtifactReboot":
+        # Automatic would reboot the host running mender-orchestrator; this Component is a
+        # separate board, so we must drive its reboot explicitly.
+        print("Yes")
+        return 0
+    if state == "SupportsRollback":
+        print("Yes")
+        return 0
+    if state == "NeedsUnpackedArtifact":
+        # "Yes": stream the UNPACKED payload file -- the inner, standalone "rootfs-image"
+        print("Yes")
+        return 0
+
+    if not component_id:
+        log("no component id (interface_args) given")
+        return 1
+
+    if state == "Identity":
+        # Print the configured component_id, not the actual Identity (e.g. MAC address) of the
+        # Component. Used only for demo purposes. Actual implementation would need to read
+        # the actual Identity, so that in case the Component is replaced, it would be shown
+        # in the Inventory.
+        print("id=%s" % component_id)
+        return 0
+
+    t = topics(component_id)
+
+    if state == "Provides":
+        broker = Broker()
+        text = broker.read_retained_text(t["provides"], QUERY_TOPIC_TIMEOUT)
+        broker.close()
+        # Mandatory key if the Component hasn't reported anything yet, same fallback
+        # rootfs-image uses before any Artifact has ever been installed.
+        print(text if text else "rootfs-image.version=unknown")
+        return 0
+
+    if state == "Inventory":
+        # No-op, matching rootfs-image's own Inventory handling exactly. Used only for demo
+        # purposes. Outside of demo, we'd like to have the real inventory from the
+        # Component's mender-update
+        return 0
+
+    if state not in FORWARDED_STATES:
+        # Unknown states: print nothing, return zero, per the Interface protocol.
+        return 0
+
+    correlation_id = "%s:%s" % (read_artifact_name(files_dir), state)
+    broker = Broker()
+
+    if state == "Download":
+        result = handle_download(broker, t, correlation_id, files_dir, component_type)
+    else:
+        result = forward_state(broker, t, state, correlation_id)
+    broker.close()
+
+    if result is None:
+        log("timed out waiting for the component to complete %s" % state)
+        return 1
+
+    if result.get("stdout"):
+        sys.stdout.write(result["stdout"])
+    if result.get("stderr"):
+        sys.stderr.write(result["stderr"])
+    return int(result.get("exit_code", 1))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

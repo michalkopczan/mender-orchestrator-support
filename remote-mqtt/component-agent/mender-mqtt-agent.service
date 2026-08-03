@@ -1,0 +1,17 @@
+[Unit]
+Description=Mender MQTT Component Agent
+Documentation=https://github.com/mendersoftware/mender-orchestrator-support/blob/main/remote-mqtt/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/mender-mqtt-agent/mender-mqtt-agent.conf
+ExecStart=/usr/share/mender-orchestrator/remote-mqtt/mender-mqtt-agent
+# mender-update, reboot and systemd-run (for the delayed reboot) all require root.
+User=root
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

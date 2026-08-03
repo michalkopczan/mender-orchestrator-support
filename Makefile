@@ -61,6 +61,41 @@ uninstall-mock-env-interfaces-v1-%: INTERFACE=$*
 uninstall-mock-env-interfaces-v1-%:
 	rm -f $(prefix)$(datadir)/mender-orchestrator/interfaces/v1/$(INTERFACE)
 
+# remote-mqtt: not part of the default install target, since the broker and the component
+# agent are two different pieces installed on two different boards (RPi #1 vs RPi #2/#3/...).
+# The mqtt-component Interface itself is a regular interfaces/v1 entry and is already covered
+# by the default `install` target above.
+
+# Run on the System Device (RPi #1), alongside the mqtt-component Interface. Plaintext,
+# appropriate for a trusted LAN -- see remote-mqtt/README.md.
+install-mqtt-broker:
+	install -m 755 -d $(prefix)/etc/mosquitto/conf.d
+	install -m 644 remote-mqtt/broker/mosquitto-orchestrator.conf $(prefix)/etc/mosquitto/conf.d/mender-orchestrator.conf
+	@echo "Installed. Still needed, as root on this board:"
+	@echo "  systemctl restart mosquitto"
+
+uninstall-mqtt-broker:
+	rm -f $(prefix)/etc/mosquitto/conf.d/mender-orchestrator.conf
+
+# Run on each Component board (RPi #2, #3, ...).
+install-mqtt-component-agent:
+	install -m 755 -d $(prefix)$(datadir)/mender-orchestrator/remote-mqtt
+	install -m 755 remote-mqtt/component-agent/mender-mqtt-agent $(prefix)$(datadir)/mender-orchestrator/remote-mqtt/mender-mqtt-agent
+	install -m 755 -d $(prefix)/etc/mender-mqtt-agent
+	install -m 644 remote-mqtt/component-agent/mender-mqtt-agent.conf.example $(prefix)/etc/mender-mqtt-agent/mender-mqtt-agent.conf.example
+	install -m 755 -d $(prefix)/lib/systemd/system
+	install -m 644 remote-mqtt/component-agent/mender-mqtt-agent.service $(prefix)/lib/systemd/system/mender-mqtt-agent.service
+	@echo "Installed. Still needed, as root on this board:"
+	@echo "  cp /etc/mender-mqtt-agent/mender-mqtt-agent.conf.example /etc/mender-mqtt-agent/mender-mqtt-agent.conf, then edit it"
+	@echo "  systemctl enable --now mender-mqtt-agent"
+
+uninstall-mqtt-component-agent:
+	systemctl disable --now mender-mqtt-agent 2>/dev/null || true
+	rm -f $(prefix)$(datadir)/mender-orchestrator/remote-mqtt/mender-mqtt-agent
+	-rmdir $(prefix)$(datadir)/mender-orchestrator/remote-mqtt
+	rm -f $(prefix)/etc/mender-mqtt-agent/mender-mqtt-agent.conf.example
+	rm -f $(prefix)/lib/systemd/system/mender-mqtt-agent.service
+
 
 .PHONY: all
 .PHONY: install
@@ -73,3 +108,7 @@ uninstall-mock-env-interfaces-v1-%:
 .PHONY: uninstall-mock-instances
 .PHONY: uninstall-mock-topology
 .PHONY: uninstall-mock-interfaces
+.PHONY: install-mqtt-broker
+.PHONY: uninstall-mqtt-broker
+.PHONY: install-mqtt-component-agent
+.PHONY: uninstall-mqtt-component-agent

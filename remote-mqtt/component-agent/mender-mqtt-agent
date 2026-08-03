@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+# Copyright 2026 Northern.tech AS
+#
+#    Licensed under the Apache License, Version 2.0 (the "License");
+#    you may not use this file except in compliance with the License.
+#    You may obtain a copy of the License at
+#
+#        http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS,
+#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#    See the License for the specific language governing permissions and
+#    limitations under the License.
+#
+# mender-mqtt-agent -- runs on a Component (e.g. RPi #2), driving the stock, unmodified
+# mender-update CLI in standalone mode from commands pushed over MQTT by the mqtt-component
+# Interface running on the System Device (RPi #1). Mirrors the exact mender-update
+# invocations used by the local `rootfs-image` Interface -- see that script for the
+# state-by-state rationale -- just executed on this board instead of locally.
+#
+# Persistent, outbound-only: this process makes one long-lived connection out to the broker
+# on RPi #1 and never accepts inbound connections. Plaintext, appropriate for a trusted LAN.
+#
+# Every (re)connect does a fresh MQTT session (clean_start=True) and explicitly
+# re-subscribes to the command topic. This is deliberate: mosquitto only replays a topic's
+# retained message to a *subscribe* call, not automatically to messages published while a
+# persistent session was offline -- so a persistent session buys nothing here, and relying
+# on a fresh subscribe + retained messages is both simpler and the mechanism that's
+# actually guaranteed to redeliver the latest command after this agent restarts (e.g. after
+# the reboot it just performed for ArtifactReboot/ArtifactRollbackReboot).
+#
+# Command handling runs on a separate worker thread from paho's network loop (loop_start()),
+# not inside on_message. Download can legitimately take minutes to stream a multi-GB
+# Artifact; running that inline in on_message would stall the same thread responsible for
+# MQTT keepalive traffic, and the broker could drop the connection mid-download for missed
+# pings. See Agent.run_forever().
+
+import json
+import os
+import queue
+import subprocess
+import sys
+import time
+import traceback
+
+import paho.mqtt.client as mqtt
+
+COMPONENT_ID = os.environ.get("MENDER_MQTT_COMPONENT_ID")
+BROKER_HOST = os.environ.get("MENDER_MQTT_BROKER_HOST")
+BROKER_PORT = int(os.environ.get("MENDER_MQTT_BROKER_PORT", "1883"))
+MENDER_UPDATE_BIN = os.environ.get("MENDER_UPDATE_BIN", "mender-update")
+STATE_DIR = os.environ.get("MENDER_MQTT_AGENT_STATE_DIR", "/var/lib/mender-mqtt-agent")
+MENDER_DATASTORE_DIR = os.environ.get("MENDER_DATASTORE_DIR", "/var/lib/mender")
+
+if not COMPONENT_ID or not BROKER_HOST:
+    sys.exit("MENDER_MQTT_COMPONENT_ID and MENDER_MQTT_BROKER_HOST must be set")
+
+BASE_TOPIC = "mender-orchestrator/%s" % COMPONENT_ID
+CMD_TOPIC = BASE_TOPIC + "/cmd"
+RESULT_TOPIC = BASE_TOPIC + "/result"
+STATUS_TOPIC = BASE_TOPIC + "/status"
+PROVIDES_TOPIC = BASE_TOPIC + "/provides"
+
+LAST_RESULT_FILE = os.path.join(STATE_DIR, "last_result.json")
+PRE_REBOOT_BOOT_ID_FILE = os.path.join(STATE_DIR, "pre_reboot_boot_id")
+BOOT_ID_FILE = os.environ.get("MENDER_MQTT_BOOT_ID_FILE", "/proc/sys/kernel/random/boot_id")
+# Generous for an SD-card Pi boot, but bounded: a reboot that never actually happens
+# (systemd-run failed, some policy blocks it, etc.) should fail loudly instead of hanging
+# this agent's single command-handling thread forever.
+REBOOT_WAIT_TIMEOUT = int(os.environ.get("MENDER_MQTT_REBOOT_WAIT_TIMEOUT", "120"))
+
+
+def log(msg):
+    print("##### [mender-mqtt-agent] %s" % msg, file=sys.stderr, flush=True)
+
+
+def run(cmd):
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as exc:
+        # e.g. MENDER_UPDATE_BIN missing or not executable -- report it like a shell
+        # "command not found" instead of raising (this can be called from _on_connect too,
+        # not just from a state handler's try/except).
+        return {"exit_code": 127, "stdout": "", "stderr": "%s: %s" % (cmd[0], exc)}
+    return {"exit_code": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
+
+
+def run_allow_no_update_in_progress(cmd):
+    # Exit code 2 from mender-update means "no update in progress", which several states
+    # (Cleanup, ArtifactRollback, ArtifactFailure) treat as already-done success -- same
+    # convention as the rootfs-image Interface.
+    result = run(cmd)
+    if result["exit_code"] == 2:
+        result["exit_code"] = 0
+    return result
+
+
+def load_last_result():
+    try:
+        with open(LAST_RESULT_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def save_last_result(result):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = LAST_RESULT_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(result, f)
+    os.replace(tmp, LAST_RESULT_FILE)
+
+
+def schedule_reboot(delay_seconds=2):
+    # Detached so it survives this process going away, and delayed so the result publish
+    # in _handle_cmd has time to reach the broker before the board goes dark.
+    subprocess.Popen(
+        ["systemd-run", "--on-active=%ds" % delay_seconds, "/sbin/reboot"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _boot_id():
+    try:
+        with open(BOOT_ID_FILE) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def record_pre_reboot_boot_id():
+    # Called right before scheduling a reboot, so wait_for_reboot() can later tell whether a
+    # genuine reboot has actually happened since, rather than trusting that scheduling one
+    # means it took effect by the time the next state is called.
+    boot_id = _boot_id()
+    if boot_id is None:
+        return
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = PRE_REBOOT_BOOT_ID_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(boot_id)
+    os.replace(tmp, PRE_REBOOT_BOOT_ID_FILE)
+
+
+def wait_for_reboot():
+    # ArtifactReboot/ArtifactRollbackReboot only *schedule* a reboot (schedule_reboot) and
+    # report success immediately -- they don't wait for it.
+    # /proc/sys/kernel/random/boot_id changes on every boot, so comparing the current value
+    # against the one recorded just before scheduling the reboot tells us whether a genuine
+    # reboot has happened since. If not, block here: either the real reboot fires and kills
+    # this process mid-wait (fine -- the orchestrator's own MQTT wait is hours long, and the
+    # freshly-restarted agent re-processes the same retained, not-yet-acknowledged command
+    # after boot, this time with a changed boot_id -- see _handle_cmd's correlation_id
+    # replay), or REBOOT_WAIT_TIMEOUT elapses and this reports a clear failure instead of
+    # hanging forever.
+    try:
+        with open(PRE_REBOOT_BOOT_ID_FILE) as f:
+            pre_reboot_boot_id = f.read().strip()
+    except OSError:
+        return None
+    current_boot_id = _boot_id()
+    if current_boot_id is None or current_boot_id != pre_reboot_boot_id:
+        return None
+    log("wait_for_reboot(): boot_id unchanged (%s) -- waiting for the scheduled reboot to actually happen" % current_boot_id)
+    deadline = time.monotonic() + REBOOT_WAIT_TIMEOUT
+    while current_boot_id == pre_reboot_boot_id:
+        if time.monotonic() >= deadline:
+            message = "reboot did not happen within %ds of being scheduled" % REBOOT_WAIT_TIMEOUT
+            log("wait_for_reboot(): %s" % message)
+            return message
+        time.sleep(1)
+        current_boot_id = _boot_id()
+    log("wait_for_reboot(): boot_id changed to %s -- reboot confirmed" % current_boot_id)
+    return None
+
+
+def read_device_type():
+    path = os.path.join(MENDER_DATASTORE_DIR, "device_type")
+    try:
+        with open(path) as f:
+            for line in f:
+                if line.startswith("device_type="):
+                    return line[len("device_type="):].strip()
+    except OSError as exc:
+        log("could not read device_type from %s: %s" % (path, exc))
+        return None
+    return None
+
+
+def handle_download(payload):
+    # Same check rootfs-image performs locally: refuse an Artifact whose component_type
+    # (the Manifest's target for this Component) doesn't match what this board actually is.
+    # Without it, a Manifest/Topology mistake could silently push the wrong rootfs onto this
+    # Component instead of failing loudly.
+    component_type = payload.get("component_type")
+    device_type = read_device_type()
+    if component_type and device_type is None:
+        path = os.path.join(MENDER_DATASTORE_DIR, "device_type")
+        message = "could not read this Component's device_type from %s" % path
+        return {"exit_code": 1, "stdout": "", "stderr": message}
+    if component_type and device_type != component_type:
+        message = "device_type of the Component does not match its component_type"
+        return {"exit_code": 1, "stdout": "", "stderr": message}
+
+    artifact_url = payload.get("artifact_url")
+    if not artifact_url:
+        return {"exit_code": 1, "stdout": "", "stderr": "no artifact_url in Download command"}
+
+    # Component's mender-update fetches the URL itself and streams it straight onto the target partition
+    # as it parses
+    return run([
+        MENDER_UPDATE_BIN, "install",
+        "--stop-before", "Cleanup",
+        "--stop-before", "ArtifactInstall_Enter",
+        "--stop-before", "ArtifactRollback_Enter",
+        artifact_url,
+    ])
+
+
+def handle_artifact_install(_payload):
+    return run([
+        MENDER_UPDATE_BIN, "resume",
+        "--stop-before", "ArtifactCommit_Enter",
+        "--stop-before", "ArtifactRollback_Enter",
+    ])
+
+
+def handle_artifact_reboot(_payload):
+    record_pre_reboot_boot_id()
+    schedule_reboot()
+    return {"exit_code": 0, "stdout": "reboot scheduled", "stderr": ""}
+
+
+def handle_artifact_verify_reboot(_payload):
+    error = wait_for_reboot()
+    if error:
+        return {"exit_code": 1, "stdout": "", "stderr": error}
+    return run([MENDER_UPDATE_BIN, "show-artifact"])
+
+
+def handle_artifact_commit(_payload):
+    return run([
+        MENDER_UPDATE_BIN, "commit",
+        "--stop-before", "ArtifactCommit_Leave",
+        "--stop-before", "ArtifactRollback_Enter",
+    ])
+
+
+def handle_cleanup(_payload):
+    return run_allow_no_update_in_progress([MENDER_UPDATE_BIN, "resume"])
+
+
+def handle_artifact_rollback(_payload):
+    return run_allow_no_update_in_progress([
+        MENDER_UPDATE_BIN, "rollback",
+        "--stop-before", "ArtifactFailure_Enter",
+    ])
+
+
+def handle_artifact_rollback_reboot(_payload):
+    record_pre_reboot_boot_id()
+    schedule_reboot()
+    return {"exit_code": 0, "stdout": "reboot scheduled", "stderr": ""}
+
+
+def handle_artifact_verify_rollback_reboot(_payload):
+    error = wait_for_reboot()
+    if error:
+        return {"exit_code": 1, "stdout": "", "stderr": error}
+    return run([MENDER_UPDATE_BIN, "show-artifact"])
+
+
+def handle_artifact_failure(_payload):
+    return run_allow_no_update_in_progress([
+        MENDER_UPDATE_BIN, "resume",
+        "--stop-before", "Cleanup",
+    ])
+
+
+STATE_HANDLERS = {
+    "Download": handle_download,
+    "ArtifactInstall": handle_artifact_install,
+    "ArtifactReboot": handle_artifact_reboot,
+    "ArtifactVerifyReboot": handle_artifact_verify_reboot,
+    "ArtifactCommit": handle_artifact_commit,
+    "Cleanup": handle_cleanup,
+    "ArtifactRollback": handle_artifact_rollback,
+    "ArtifactRollbackReboot": handle_artifact_rollback_reboot,
+    "ArtifactVerifyRollbackReboot": handle_artifact_verify_rollback_reboot,
+    "ArtifactFailure": handle_artifact_failure,
+}
+
+
+class Agent:
+    def __init__(self):
+        self.client = mqtt.Client(client_id=COMPONENT_ID, protocol=mqtt.MQTTv5)
+        self.client.will_set(STATUS_TOPIC, b"offline", qos=1, retain=True)
+        self.client.on_connect = self._on_connect
+        self.client.on_message = self._on_message
+        self.client.reconnect_delay_set(min_delay=1, max_delay=30)
+        # _on_message (network thread) only enqueues; _handle_cmd (run_forever's thread)
+        # does the actual, potentially slow, work. See the module docstring.
+        self._cmd_queue = queue.Queue()
+
+    def _on_connect(self, client, _userdata, _flags, reason_code, _properties=None):
+        log("connected to broker (reason_code=%s)" % reason_code)
+        client.publish(STATUS_TOPIC, b"online", qos=1, retain=True)
+        client.publish(PROVIDES_TOPIC, self._provides_output(), qos=1, retain=True)
+        # No Inventory publish, not supported for demo purposes. Would require
+        # implementing a show-inventory command for mender-update
+        client.subscribe(CMD_TOPIC, qos=1)
+
+    def _provides_output(self):
+        result = run([MENDER_UPDATE_BIN, "show-provides"])
+        if result["exit_code"] != 0 or not result["stdout"]:
+            return b"rootfs-image.version=unknown"
+        return result["stdout"].encode()
+
+    def _on_message(self, _client, _userdata, msg):
+        if msg.topic != CMD_TOPIC:
+            return
+        self._cmd_queue.put(msg.payload)
+
+    def _handle_cmd(self, raw_payload):
+        try:
+            payload = json.loads(raw_payload.decode())
+        except (ValueError, UnicodeDecodeError):
+            log("dropping malformed cmd payload on %s" % CMD_TOPIC)
+            return
+        correlation_id = payload.get("correlation_id")
+        state = payload.get("state")
+        if not correlation_id or not state:
+            log("dropping cmd payload missing correlation_id/state")
+            return
+
+        last = load_last_result()
+        if last and last.get("correlation_id") == correlation_id:
+            log("%s (%s) already completed, re-publishing cached result" % (state, correlation_id))
+            self._publish_result(last)
+            return
+
+        handler = STATE_HANDLERS.get(state)
+        if handler is None:
+            log("no handler for state %s, ignoring" % state)
+            return
+
+        log("executing %s (%s)" % (state, correlation_id))
+        try:
+            result = handler(payload)
+        except Exception:
+            # A crash here must not crash the whole agent. Since nothing gets published on
+            # an uncaught exception, the command never completes, and after a restart the
+            # same retained command is redelivered -- an uncaught bug here becomes a silent,
+            # permanent crash loop instead of one failed state. Report it as a normal
+            # failure instead.
+            log("unhandled exception executing %s (%s):\n%s" % (state, correlation_id, traceback.format_exc()))
+            result = {"exit_code": 1, "stdout": "", "stderr": traceback.format_exc()}
+        result["correlation_id"] = correlation_id
+        save_last_result(result)
+        self._publish_result(result)
+        log("result for %s (%s) published" % (state, correlation_id))
+        if state == "Cleanup" and result.get("exit_code") == 0:
+            # The only place the datastore's artifact-name/artifact-provides keys actually get
+            # (re)written is CommitArtifactData, called from mender-update's own CleanupState.
+            # handle_cleanup's plain `resume` (no --stop-before) is what
+            # drives the state machine through there. Re-publishing here, right after Cleanup
+            # itself succeeds (whether that's the normal success path or the tail end of a
+            # rollback), keeps it truthful without needing another reconnect.
+            self.client.publish(PROVIDES_TOPIC, self._provides_output(), qos=1, retain=True)
+            log("provides re-published after Cleanup (%s)" % correlation_id)
+
+    def _publish_result(self, result):
+        info = self.client.publish(RESULT_TOPIC, json.dumps(result), qos=1, retain=True)
+        info.wait_for_publish(timeout=30)
+
+    def run_forever(self):
+        self.client.connect(BROKER_HOST, BROKER_PORT, keepalive=30, clean_start=True)
+        # loop_start() runs paho's network I/O (including keepalive PINGREQ/PINGRESP) on its
+        # own thread, so a slow command handler below never risks the broker dropping this
+        # connection for missed pings.
+        self.client.loop_start()
+        while True:
+            raw_payload = self._cmd_queue.get()
+            self._handle_cmd(raw_payload)
+
+
+if __name__ == "__main__":
+    Agent().run_forever()
